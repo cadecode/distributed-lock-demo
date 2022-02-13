@@ -1,0 +1,17 @@
+server:
+  port: 8080
+
+mybatis:
+  mapper-locations: classpath*:mapper/**/*.xml
+  type-aliases-package: top.cadecode
+  configuration:
+    map-underscore-to-camel-case: true
+
+spring:
+  application:
+    name: distribute-lock-demo
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/demo?useSSL=true&useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+    username: root
+    password: dbAdm

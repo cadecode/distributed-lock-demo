@@ -1,9 +1,11 @@
 package top.cadecode.app;
 
+import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.servlet.support.SpringBootServletInitializer;
+import org.springframework.context.annotation.ComponentScan;
 
 /**
  * @author Cade Li
@@ -11,6 +13,8 @@ import org.springframework.boot.web.servlet.support.SpringBootServletInitializer
  * @description 启动类
  */
 @SpringBootApplication
+@ComponentScan("top.cadecode")
+@MapperScan("top.cadecode.mysql")
 public class DistributedLockDemoApp extends SpringBootServletInitializer {
     public static void main(String[] args) {
         SpringApplication.run(DistributedLockDemoApp.class, args);
