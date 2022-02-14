@@ -1,0 +1,14 @@
+CREATE TABLE IF NOT EXISTS lock_info
+(
+    id          BIGINT UNSIGNED AUTO_INCREMENT,
+    name        VARCHAR(255) NOT NULL COMMENT '锁名称',
+    ip          VARCHAR(20) COMMENT 'ip',
+    thread_id   BIGINT UNSIGNED COMMENT '线程 id',
+    count     BIGINT UNSIGNED COMMENT '重入次数',
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_name (name)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8
+    COMMENT '锁信息';
