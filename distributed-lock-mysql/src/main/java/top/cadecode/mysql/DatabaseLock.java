@@ -86,6 +86,7 @@ public class DatabaseLock implements DistributedLock {
      * @param timeUnit 时间单位
      * @return 是否获取锁
      */
+    @Override
     public boolean tryLock(String name, long timeout, TimeUnit timeUnit) {
         startTransaction(name);
         // 尝试的总时间
@@ -123,7 +124,7 @@ public class DatabaseLock implements DistributedLock {
         }
         // 比较重入次数
         LockInfo oldLockInfo = lockInfoMapper.getLockInfo(lockNameLocal.get());
-        LockInfo newLockInfo = lockInfo(lockNameLocal.get());
+        LockInfo newLockInfo = create(lockNameLocal.get());
         // 判断是否重入
         if (!compare(oldLockInfo, newLockInfo)) {
             return;
@@ -185,7 +186,7 @@ public class DatabaseLock implements DistributedLock {
         // 判断 lock 为空，则插入 lock 信息
         if (oldLockInfo == null) {
             try {
-                lockInfoMapper.addLockInfo(this.lockInfo(name));
+                lockInfoMapper.addLockInfo(create(name));
             } catch (Exception e) {
                 // 插入报错再此处捕获
             } finally {
@@ -206,7 +207,7 @@ public class DatabaseLock implements DistributedLock {
      */
     private void update(LockInfo oldLockInfo) {
         // 创建新的 LockInfo
-        LockInfo newLockInfo = lockInfo(oldLockInfo.getName());
+        LockInfo newLockInfo = create(oldLockInfo.getName());
         // 判断是否是重入
         if (compare(oldLockInfo, newLockInfo)) {
             // 重入次数 +1
@@ -239,7 +240,7 @@ public class DatabaseLock implements DistributedLock {
      * @return 锁信息对象
      */
     @SneakyThrows
-    private LockInfo lockInfo(String name) {
+    private LockInfo create(String name) {
         LockInfo lockInfo = new LockInfo();
         lockInfo.setName(name);
         lockInfo.setIp(InetAddress.getLocalHost().getHostAddress());
