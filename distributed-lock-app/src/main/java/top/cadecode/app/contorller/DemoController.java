@@ -6,6 +6,8 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 import top.cadecode.mysql.DatabaseLock;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * @author Cade Li
  * @date 2022/2/13
@@ -40,7 +42,7 @@ public class DemoController {
     @GetMapping("database_try_lock")
     public String databaseTryLock() throws InterruptedException {
         log.info("===开始加锁");
-        boolean lock0001 = databaseLock.tryLock("lock0001");
+        boolean lock0001 = databaseLock.tryLock("lock0001", 3, TimeUnit.SECONDS);
         if (lock0001) {
             try {
                 log.info("===开始业务");

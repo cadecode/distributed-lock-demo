@@ -12,6 +12,8 @@ import top.cadecode.mysql.mapper.LockInfoMapper;
 
 import java.net.InetAddress;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 /**
  * @author Cade Li
@@ -47,19 +49,7 @@ public class DatabaseLock implements DistributedLock {
     @Override
     public void lock(String name) {
         startTransaction(name);
-        // 查询 lock 信息，若已经被 for update 则阻塞等待
-        LockInfo oldLockInfo = lockInfoMapper.getLockInfoForUpdate(name);
-        // 判断 lock 为空，则插入 lock 信息
-        if (oldLockInfo == null) {
-            try {
-                lockInfoMapper.addLockInfo(this.lockInfo(name));
-            } catch (Exception e) {
-                // 插入报错再此处捕获
-            } finally {
-                // 再次 for update
-                oldLockInfo = lockInfoMapper.getLockInfoForUpdate(name);
-            }
-        }
+        LockInfo oldLockInfo = getOrAdd(name, lockInfoMapper::getLockInfoForUpdate);
         // 获得锁后，修改 lock 信息
         update(oldLockInfo);
     }
@@ -76,27 +66,49 @@ public class DatabaseLock implements DistributedLock {
         startTransaction(name);
         LockInfo oldLockInfo = null;
         try {
-            // 查询 lock 信息，若已经被 for update 则报错
-            oldLockInfo = lockInfoMapper.getLockInfoForUpdateNoWait(name);
-            // 判断 lock 为空，则插入 lock 信息
-            if (oldLockInfo == null) {
-                try {
-                    lockInfoMapper.addLockInfo(this.lockInfo(name));
-                } catch (Exception e) {
-                    // 插入报错再此处捕获
-                } finally {
-                    // 再次 for update no wait
-                    oldLockInfo = lockInfoMapper.getLockInfoForUpdateNoWait(name);
-                }
-            }
+            oldLockInfo = getOrAdd(name, lockInfoMapper::getLockInfoForUpdateNoWait);
         } catch (Exception e) {
-            // 报错原因有：第一次 for update 报错，finally 中 for update 报错
+            // 进入此处表示 for update nowait 失败，清除事务
             clearTransaction();
             return false;
         }
         // 获取锁后，修改 lock 信息
         update(oldLockInfo);
         return true;
+    }
+
+
+    /**
+     * 非阻塞的获取锁，在指定时间内反复重试
+     *
+     * @param name     锁名称
+     * @param timeout  尝试时间
+     * @param timeUnit 时间单位
+     * @return 是否获取锁
+     */
+    public boolean tryLock(String name, long timeout, TimeUnit timeUnit) {
+        startTransaction(name);
+        // 尝试的总时间
+        long totalTime = timeUnit.toMillis(timeout);
+        // 当前时间
+        long current = System.currentTimeMillis();
+        // 锁信息
+        LockInfo oldLockInfo = null;
+        while (System.currentTimeMillis() - current <= totalTime) {
+            try {
+                oldLockInfo = getOrAdd(name, lockInfoMapper::getLockInfoForUpdateNoWait);
+                // 休息 300 毫秒
+                TimeUnit.MILLISECONDS.sleep(300);
+            } catch (Exception e) {
+                // 进入此处表示 for update nowait 失败，继续循环
+                continue;
+            }
+            // 执行到次数，表示获取锁，修改 lock 信息
+            update(oldLockInfo);
+            return true;
+        }
+        clearTransaction();
+        return false;
     }
 
     /**
@@ -137,6 +149,9 @@ public class DatabaseLock implements DistributedLock {
      * @param name 锁名称
      */
     private void startTransaction(String name) {
+        if (name == null) {
+            throw new RuntimeException("锁名称不能为空");
+        }
         if (statusLocal.get() == null) {
             // 开启新事务
             TransactionStatus status = transactionManager.getTransaction(definition);
@@ -154,6 +169,33 @@ public class DatabaseLock implements DistributedLock {
         transactionManager.commit(statusLocal.get());
         statusLocal.remove();
         lockNameLocal.remove();
+    }
+
+    /**
+     * 查询锁信息，不存在就插入
+     * fn 可以是 for update / for update nowait
+     *
+     * @param name 锁名称
+     * @param fn   查询锁信息
+     * @return 锁信息
+     */
+    private LockInfo getOrAdd(String name, Function<String, LockInfo> fn) {
+        // 查询 lock，此处可能阻塞或直接失败报错
+        LockInfo oldLockInfo = fn.apply(name);
+        // 判断 lock 为空，则插入 lock 信息
+        if (oldLockInfo == null) {
+            try {
+                lockInfoMapper.addLockInfo(this.lockInfo(name));
+            } catch (Exception e) {
+                // 插入报错再此处捕获
+            } finally {
+                // 再次查询，此时锁信息存在
+                // 若没有抢到执行机会，for update 会在此处阻塞等待
+                // 如果加了 nowait, 就直接报错
+                oldLockInfo = fn.apply(name);
+            }
+        }
+        return oldLockInfo;
     }
 
     /**
