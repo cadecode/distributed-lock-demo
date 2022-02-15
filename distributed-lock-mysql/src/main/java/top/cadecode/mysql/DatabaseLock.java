@@ -129,9 +129,6 @@ public class DatabaseLock implements DistributedLock {
         if (!compare(oldLockInfo, newLockInfo)) {
             return;
         }
-        if (oldLockInfo.getCount() == 0) {
-            return;
-        }
         // 重入次数 -1
         if (oldLockInfo.getCount() > 1) {
             newLockInfo.setCount(oldLockInfo.getCount() - 1);
@@ -212,8 +209,6 @@ public class DatabaseLock implements DistributedLock {
         if (compare(oldLockInfo, newLockInfo)) {
             // 重入次数 +1
             newLockInfo.setCount(oldLockInfo.getCount() + 1);
-        } else {
-            newLockInfo.setCount(1L);
         }
         lockInfoMapper.updateLockInfo(newLockInfo);
     }
@@ -245,8 +240,8 @@ public class DatabaseLock implements DistributedLock {
         lockInfo.setName(name);
         lockInfo.setIp(InetAddress.getLocalHost().getHostAddress());
         lockInfo.setThreadId(Thread.currentThread().getId());
-        // 重入次数默认初始化为 0 次
-        lockInfo.setCount(0L);
+        // 重入次数默认初始化为 1 次
+        lockInfo.setCount(1L);
         return lockInfo;
     }
 }
