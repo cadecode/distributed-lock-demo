@@ -1,14 +1,12 @@
 package top.cadecode.redis;
 
-import lombok.Data;
 import lombok.RequiredArgsConstructor;
-import lombok.SneakyThrows;
-import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 import top.cadecode.common.DistributedLock;
 
-import java.lang.management.LockInfo;
-import java.net.InetAddress;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
@@ -20,142 +18,126 @@ import java.util.concurrent.TimeUnit;
 @Component
 @RequiredArgsConstructor
 public class RedisLock implements DistributedLock {
-    // 存储锁名称
-    private final ThreadLocal<String> lockNameLocal = new ThreadLocal<>();
 
-    private final RedisTemplate<String, Object> redisTemplateForLock;
+    private final StringRedisTemplate redisTemplate;
+
+    private final ThreadLocal<Map<String, Integer>> countMapLocal = ThreadLocal.withInitial(HashMap::new);
 
     @Override
     public void lock(String name) {
+        if (checkReentrant(name)) {
+            storeLock(name, true);
+            return;
+        }
         while (true) {
-            if (tryLock(name)) {
+            if (tryLock0(name)) {
                 return;
             }
-            // 休息 300 毫秒
-            try {
-                TimeUnit.MILLISECONDS.sleep(300);
-            } catch (InterruptedException e) {
-                // 不响应中断
-            }
+            sleep(300, TimeUnit.MILLISECONDS);
         }
     }
 
     @Override
     public boolean tryLock(String name) {
-        if (name == null) {
-            throw new RuntimeException("锁名称不能为空");
+        if (checkReentrant(name)) {
+            storeLock(name, true);
+            return true;
         }
-        // 判断不存在 lock，说明不是重入
-        if (lockNameLocal.get() == null) {
-            RedisLockInfo lockInfo = create();
-            Boolean success = redisTemplateForLock.opsForValue().setIfAbsent(name, lockInfo);
-            if (Objects.equals(success, true)) {
-                // 设置重入的标志
-                lockNameLocal.set(name);
-                return true;
-            }
-            return false;
-        }
-        RedisLockInfo oldLockInfo = (RedisLockInfo) redisTemplateForLock.opsForValue().get(lockNameLocal.get());
-        update(oldLockInfo);
-        return true;
+        return tryLock0(name);
     }
 
     @Override
     public boolean tryLock(String name, long timeout, TimeUnit timeUnit) {
-        // 尝试的总时间
+        if (checkReentrant(name)) {
+            storeLock(name, true);
+            return true;
+        }
         long totalTime = timeUnit.toMillis(timeout);
-        // 当前时间
         long current = System.currentTimeMillis();
         while (System.currentTimeMillis() - current <= totalTime) {
-            if (tryLock(name)) {
+            if (tryLock0(name)) {
                 return true;
             }
             // 休息 300 毫秒
-            try {
-                TimeUnit.MILLISECONDS.sleep(300);
-            } catch (InterruptedException e) {
-                // 不响应中断
-            }
+            sleep(300, TimeUnit.MILLISECONDS);
         }
         return false;
     }
 
     @Override
-    public void unlock() {
-        String lockName = lockNameLocal.get();
-        if (lockName == null) {
+    public void unlock(String name) {
+        if (!checkReentrant(name)) {
             return;
         }
-        RedisLockInfo oldLockInfo = (RedisLockInfo) redisTemplateForLock.opsForValue().get(lockName);
-        RedisLockInfo newLockInfo = create();
+        Integer count = countMapLocal.get().get(name);
+        // 重入次数减一
+        if (count > 0) {
+            countMapLocal.get().put(name, --count);
+        }
+        // 释放锁
+        if (count == 0) {
+            redisTemplate.delete(name);
+            countMapLocal.get().remove(name);
+        }
+    }
+
+    /**
+     * 检查重入
+     *
+     * @param name 锁名称
+     * @return 是否重入
+     */
+    private boolean checkReentrant(String name) {
+        if (Objects.isNull(name)) {
+            throw new RuntimeException("锁名称不能为空");
+        }
         // 判断是否重入
-        if (!compare(oldLockInfo, newLockInfo)) {
+        return Objects.nonNull(countMapLocal.get().get(name));
+    }
+
+    /**
+     * 保存重入次数到 ThreadLocal
+     *
+     * @param name 锁名称
+     */
+    private void storeLock(String name, boolean reentrant) {
+        if (reentrant) {
+            // 重入次数加一
+            Integer count = countMapLocal.get().get(name);
+            countMapLocal.get().put(name, count + 1);
             return;
         }
-        // 判断重入次数
-        if (oldLockInfo.getCount() > 1) {
-            oldLockInfo.setCount(oldLockInfo.getCount() - 1);
-            redisTemplateForLock.opsForValue().set(lockName, oldLockInfo);
-            return;
+        // 初始化为 1
+        countMapLocal.get().put(name, 1);
+    }
+
+    /**
+     * 尝试设置 redis key
+     *
+     * @param name 锁名称
+     * @return 是否设置成功
+     */
+    private boolean tryLock0(String name) {
+        Boolean success = redisTemplate.opsForValue().setIfAbsent(name, "");
+        // 设置成功
+        if (Objects.equals(success, true)) {
+            storeLock(name, false);
+            return true;
         }
-        redisTemplateForLock.delete(lockName);
-        lockNameLocal.remove();
+        return false;
     }
 
     /**
-     * 获取锁后，更新锁信息
-     * 如果是重入锁，就对 count + 1
+     * 休眠一定时间
      *
-     * @param oldLockInfo 旧的锁信息
+     * @param timeout  超时时间
+     * @param timeUnit 时间单位
      */
-    private void update(RedisLockInfo oldLockInfo) {
-        // 创建新的 LockInfo
-        RedisLockInfo newLockInfo = create();
-        // 判断是否是重入
-        if (compare(oldLockInfo, newLockInfo)) {
-            // 重入次数 +1
-            newLockInfo.setCount(oldLockInfo.getCount() + 1);
+    private void sleep(long timeout, TimeUnit timeUnit) {
+        try {
+            timeUnit.sleep(timeout);
+        } catch (InterruptedException e) {
+            // 不响应中断
         }
-        redisTemplateForLock.opsForValue().set(lockNameLocal.get(), newLockInfo);
-    }
-
-    /**
-     * 比较锁信息，判断是否是重入
-     *
-     * @param oldLockInfo 旧的锁信息
-     * @param newLockInfo 新的锁信息
-     * @return 是否是相同的锁
-     */
-    private boolean compare(RedisLockInfo oldLockInfo, RedisLockInfo newLockInfo) {
-        // 比 ip、线程号
-        return Objects.equals(oldLockInfo.getIp(), newLockInfo.getIp())
-                && Objects.equals(oldLockInfo.getThreadId(), newLockInfo.getThreadId());
-    }
-
-    /**
-     * 创建一个锁信息对象
-     * count 初始化为 0
-     *
-     * @return 锁信息对象
-     */
-    @SneakyThrows
-    private RedisLockInfo create() {
-        RedisLockInfo lockInfo = new RedisLockInfo();
-        lockInfo.setIp(InetAddress.getLocalHost().getHostAddress());
-        lockInfo.setThreadId(Thread.currentThread().getId());
-        // 重入次数默认初始化为 1 次
-        lockInfo.setCount(1L);
-        return lockInfo;
-    }
-
-    /**
-     * Redis 锁信息
-     */
-    @Data
-    static class RedisLockInfo {
-        private String ip;
-        private Long threadId;
-        private Long count;
     }
 }
