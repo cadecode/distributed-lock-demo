@@ -1,16 +1,15 @@
 package top.cadecode.mysql;
 
-import lombok.RequiredArgsConstructor;
-import lombok.SneakyThrows;
+import lombok.*;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionDefinition;
-import org.springframework.transaction.TransactionStatus;
 import top.cadecode.common.DistributedLock;
-import top.cadecode.mysql.domain.LockInfo;
-import top.cadecode.mysql.mapper.LockInfoMapper;
 
-import java.net.InetAddress;
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
@@ -24,224 +23,229 @@ import java.util.function.Function;
 @RequiredArgsConstructor
 public class DatabaseLock implements DistributedLock {
 
-    // 存储事务状态，用于提交释放锁
-    private final ThreadLocal<TransactionStatus> statusLocal = new ThreadLocal<>();
-    // 存储锁名称
-    private final ThreadLocal<String> lockNameLocal = new ThreadLocal<>();
-    // 定义事务规则，每次申请锁开启新事务
-    private final TransactionDefinition definition = new TransactionDefinition() {
-        @Override
-        public int getPropagationBehavior() {
-            return PROPAGATION_REQUIRES_NEW;
-        }
-    };
+    private final DataSource dataSource;
 
-    private final LockInfoMapper lockInfoMapper;
-    private final PlatformTransactionManager transactionManager;
+    private final ThreadLocal<Map<String, LockContent>> contentMapLocal = ThreadLocal.withInitial(HashMap::new);
 
-    /**
-     * 阻塞的获取锁
-     * 利用 for update 获取不到锁就阻塞等待特性
-     * 当锁在表中不存在时，先插入，再次 for update
-     *
-     * @param name 锁唯一名称
-     */
     @Override
     public void lock(String name) {
-        startTransaction(name);
-        LockInfo oldLockInfo = getOrAdd(name, lockInfoMapper::getLockInfoForUpdate);
-        // 获得锁后，修改 lock 信息
-        update(oldLockInfo);
+        if (checkReentrant(name)) {
+            storeLock(name, null, true);
+            return;
+        }
+        Connection connection = createConnection(name);
+        LockDao lockDao = new LockDao(connection);
+        // for update 加锁
+        getLock(name, lockDao, lockDao::selectForUpdate);
+        // 保存锁内容
+        storeLock(name, connection, false);
     }
 
-    /**
-     * 非阻塞的获取锁
-     * 利用 for update nowait 获取不到锁就报错的特性
-     *
-     * @param name 锁唯一名称
-     * @return 是否获取锁
-     */
     @Override
     public boolean tryLock(String name) {
-        startTransaction(name);
-        LockInfo oldLockInfo = null;
+        if (checkReentrant(name)) {
+            storeLock(name, null, true);
+            return true;
+        }
+        Connection connection = createConnection(name);
+        LockDao lockDao = new LockDao(connection);
         try {
-            oldLockInfo = getOrAdd(name, lockInfoMapper::getLockInfoForUpdateNoWait);
+            getLock(name, lockDao, lockDao::selectForUpdateNoWait);
         } catch (Exception e) {
-            // 进入此处表示 for update nowait 失败，清除事务
-            clearTransaction();
+            clearConnection(connection);
             return false;
         }
-        // 获取锁后，修改 lock 信息
-        update(oldLockInfo);
+        // 保存锁内容
+        storeLock(name, connection, false);
         return true;
     }
 
-
-    /**
-     * 非阻塞的获取锁，在指定时间内反复重试
-     *
-     * @param name     锁名称
-     * @param timeout  尝试时间
-     * @param timeUnit 时间单位
-     * @return 是否获取锁
-     */
     @Override
     public boolean tryLock(String name, long timeout, TimeUnit timeUnit) {
-        startTransaction(name);
+        if (checkReentrant(name)) {
+            storeLock(name, null, true);
+            return true;
+        }
+        Connection connection = createConnection(name);
+        LockDao lockDao = new LockDao(connection);
         // 尝试的总时间
         long totalTime = timeUnit.toMillis(timeout);
         // 当前时间
         long current = System.currentTimeMillis();
-        // 锁信息
-        LockInfo oldLockInfo = null;
         while (System.currentTimeMillis() - current <= totalTime) {
             try {
-                oldLockInfo = getOrAdd(name, lockInfoMapper::getLockInfoForUpdateNoWait);
-                // 休息 300 毫秒
-                TimeUnit.MILLISECONDS.sleep(300);
+                getLock(name, lockDao, lockDao::selectForUpdateNoWait);
             } catch (Exception e) {
-                // 进入此处表示 for update nowait 失败，继续循环
                 continue;
             }
-            // 执行到次数，表示获取锁，修改 lock 信息
-            update(oldLockInfo);
+            // 保存锁内容
+            storeLock(name, connection, false);
             return true;
         }
-        clearTransaction();
+        clearConnection(connection);
         return false;
     }
 
-    /**
-     * 解锁
-     * 如果查询到的锁记录不是当前机器线程，直接 return 避免释放了其他线程的锁
-     * 如果重入次数 > 1，就 -1，如果 = 1，就设置为 0，就提交事务释放锁
-     */
     @Override
-    public void unlock() {
-        if (statusLocal.get() == null) {
-            return;
-        }
-        // 比较重入次数
-        LockInfo oldLockInfo = lockInfoMapper.getLockInfo(lockNameLocal.get());
-        LockInfo newLockInfo = create(lockNameLocal.get());
+    public void unlock(String name) {
         // 判断是否重入
-        if (!compare(oldLockInfo, newLockInfo)) {
+        if (!checkReentrant(name)) {
             return;
         }
-        // 重入次数 -1
-        if (oldLockInfo.getCount() > 1) {
-            newLockInfo.setCount(oldLockInfo.getCount() - 1);
-            lockInfoMapper.updateLockInfo(newLockInfo);
-            return;
+        // 获取锁内容
+        LockContent lockContent = contentMapLocal.get().get(name);
+        Integer count = lockContent.getCount();
+        if (count > 0) {
+            // 次数减一
+            lockContent.setCount(--count);
         }
-        newLockInfo.setCount(0L);
-        lockInfoMapper.updateLockInfo(newLockInfo);
-        clearTransaction();
+        if (count == 0) {
+            // 提交事务，关闭 connection
+            Connection connection = lockContent.getConnection();
+            clearConnection(connection);
+            // 删除对应的锁内容
+            contentMapLocal.get().remove(name);
+        }
     }
 
     /**
-     * 开启事务
-     * 如果事务存在就不创建
+     * 检查重入
      *
      * @param name 锁名称
+     * @return 是否重入
      */
-    private void startTransaction(String name) {
-        if (name == null) {
+    private boolean checkReentrant(String name) {
+        if (Objects.isNull(name)) {
             throw new RuntimeException("锁名称不能为空");
         }
-        if (statusLocal.get() == null) {
-            // 开启新事务
-            TransactionStatus status = transactionManager.getTransaction(definition);
-            // 存储事务状态
-            statusLocal.set(status);
-            // 存储锁名称
-            lockNameLocal.set(name);
-        }
+        // 判断是否重入
+        LockContent lockContent = contentMapLocal.get().get(name);
+        return Objects.nonNull(lockContent);
     }
 
     /**
-     * 清除事务
-     */
-    private void clearTransaction() {
-        transactionManager.commit(statusLocal.get());
-        statusLocal.remove();
-        lockNameLocal.remove();
-    }
-
-    /**
-     * 查询锁信息，不存在就插入
-     * fn 可以是 for update / for update nowait
+     * 保存锁内容到 ThreadLocal
      *
      * @param name 锁名称
-     * @param fn   查询锁信息
-     * @return 锁信息
      */
-    private LockInfo getOrAdd(String name, Function<String, LockInfo> fn) {
-        // 查询 lock，此处可能阻塞或直接失败报错
-        LockInfo oldLockInfo = fn.apply(name);
-        // 判断 lock 为空，则插入 lock 信息
-        if (oldLockInfo == null) {
-            try {
-                lockInfoMapper.addLockInfo(create(name));
-            } catch (Exception e) {
-                // 插入报错再此处捕获
-            } finally {
-                // 再次查询，此时锁信息存在
-                // 若没有抢到执行机会，for update 会在此处阻塞等待
-                // 如果加了 nowait, 就直接报错
-                oldLockInfo = fn.apply(name);
-            }
+    private void storeLock(String name, Connection connection, boolean reentrant) {
+        LockContent lockContent;
+        if (reentrant) {
+            lockContent = contentMapLocal.get().get(name);
+            // 重入次数加一
+            lockContent.setCount(lockContent.getCount() + 1);
+            return;
         }
-        return oldLockInfo;
+        // 创建新的 LockContent
+        lockContent = new LockContent(connection, 1);
+        contentMapLocal.get().put(name, lockContent);
     }
 
     /**
-     * 获取锁后，更新锁信息
-     * 如果是重入锁，就对 count + 1
+     * 获取 connection
      *
-     * @param oldLockInfo 旧的锁信息
-     */
-    private void update(LockInfo oldLockInfo) {
-        // 创建新的 LockInfo
-        LockInfo newLockInfo = create(oldLockInfo.getName());
-        // 判断是否是重入
-        if (compare(oldLockInfo, newLockInfo)) {
-            // 重入次数 +1
-            newLockInfo.setCount(oldLockInfo.getCount() + 1);
-        }
-        lockInfoMapper.updateLockInfo(newLockInfo);
-    }
-
-    /**
-     * 比较锁信息，判断是否是重入
-     *
-     * @param oldLockInfo 旧的锁信息
-     * @param newLockInfo 新的锁信息
-     * @return 是否是相同的锁
-     */
-    private boolean compare(LockInfo oldLockInfo, LockInfo newLockInfo) {
-        // 比较锁名称、ip、线程号
-        return Objects.equals(oldLockInfo.getName(), newLockInfo.getName())
-                && Objects.equals(oldLockInfo.getIp(), newLockInfo.getIp())
-                && Objects.equals(oldLockInfo.getThreadId(), newLockInfo.getThreadId());
-    }
-
-    /**
-     * 创建一个锁信息对象
-     * count 初始化为 0
-     *
-     * @param name 锁名称
-     * @return 锁信息对象
+     * @return 数据库连接
      */
     @SneakyThrows
-    private LockInfo create(String name) {
-        LockInfo lockInfo = new LockInfo();
-        lockInfo.setName(name);
-        lockInfo.setIp(InetAddress.getLocalHost().getHostAddress());
-        lockInfo.setThreadId(Thread.currentThread().getId());
-        // 重入次数默认初始化为 1 次
-        lockInfo.setCount(1L);
-        return lockInfo;
+    private Connection createConnection(String name) {
+        Connection connection = dataSource.getConnection();
+        connection.setAutoCommit(false);
+        return connection;
+    }
+
+    /**
+     * 清除 connection
+     */
+    @SneakyThrows
+    private void clearConnection(Connection connection) {
+        if (Objects.nonNull(connection)) {
+            connection.commit();
+            connection.close();
+        }
+    }
+
+    /**
+     * 查询锁记录，不存在就插入
+     *
+     * @param name   锁名称
+     * @param dao    DAO
+     * @param select 查询
+     * @return 锁名称
+     */
+    private String getLock(String name, LockDao dao, Function<String, String> select) {
+        String lockName = select.apply(name);
+        // for update 查询到数据，加锁成功
+        if (Objects.nonNull(lockName)) {
+            return lockName;
+        }
+        try {
+            // 插入 name
+            dao.insert(name);
+        } catch (Exception e) {
+            // 捕获插入异常
+        } finally {
+            // 再次加锁
+            lockName = select.apply(name);
+        }
+        return lockName;
+    }
+
+    /**
+     * 锁内容
+     * 维护 Connection 和重入次数
+     */
+    @Data
+    @AllArgsConstructor
+    private static class LockContent {
+        /**
+         * 数据库连接
+         */
+        private Connection connection;
+        /**
+         * 重入次数
+         */
+        private Integer count;
+    }
+
+    /**
+     * 锁记录 DAO
+     * 增加或查询锁记录，其中 name 为主键
+     */
+    private static class LockDao {
+
+        final Connection connection;
+
+        LockDao(Connection connection) {
+            this.connection = connection;
+        }
+
+        @SneakyThrows
+        String selectForUpdate(String name) {
+            @Cleanup Statement statement = connection.createStatement();
+            String sql = "select name from distributed_lock where name = '" + name + "' for update";
+            ResultSet resultSet = statement.executeQuery(sql);
+            if (resultSet.next()) {
+                return resultSet.getString("name");
+            }
+            return null;
+        }
+
+        @SneakyThrows
+        String selectForUpdateNoWait(String name) {
+            @Cleanup Statement statement = connection.createStatement();
+            String sql = "select name from distributed_lock where name = '" + name + "' for update nowait";
+            ResultSet resultSet = statement.executeQuery(sql);
+            if (resultSet.next()) {
+                return resultSet.getString("name");
+            }
+            return null;
+        }
+
+        @SneakyThrows
+        void insert(String name) {
+            @Cleanup Statement statement = connection.createStatement();
+            String sql = "insert into distributed_lock (name) values ('" + name + "')";
+            statement.executeUpdate(sql);
+        }
     }
 }

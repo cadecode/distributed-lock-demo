@@ -20,9 +20,9 @@ public class DemoController {
 
     private final DatabaseLock databaseLock;
 
-    @GetMapping("database_lock")
+    @GetMapping("test_lock")
     public String databaseLock() throws InterruptedException {
-        databaseLock.unlock();
+        databaseLock.unlock("lock0001");
 
         log.info("===开始加锁");
         databaseLock.lock("lock0001");
@@ -32,14 +32,14 @@ public class DemoController {
             Thread.sleep(5000);
             log.info("===业务结束，释放锁");
         } finally {
-            databaseLock.unlock();
+            databaseLock.unlock("lock0001");
             Thread.sleep(2000);
-            databaseLock.unlock();
+            databaseLock.unlock("lock0001");
         }
         return "返回数据";
     }
 
-    @GetMapping("database_try_lock")
+    @GetMapping("test_try_lock")
     public String databaseTryLock() throws InterruptedException {
         log.info("===开始加锁");
         boolean lock0001 = databaseLock.tryLock("lock0001", 3, TimeUnit.SECONDS);
@@ -49,7 +49,7 @@ public class DemoController {
                 Thread.sleep(5000);
                 log.info("===业务结束，释放锁");
             } finally {
-                databaseLock.unlock();
+                databaseLock.unlock("lock0001");
             }
             return "返回数据";
         } else {
