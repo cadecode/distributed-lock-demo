@@ -1,5 +1,7 @@
 package top.cadecode.redis;
 
+import lombok.AllArgsConstructor;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -8,6 +10,8 @@ import top.cadecode.common.DistributedLock;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -21,26 +25,29 @@ public class RedisLock implements DistributedLock {
 
     private final StringRedisTemplate redisTemplate;
 
-    private final ThreadLocal<Map<String, Integer>> countMapLocal = ThreadLocal.withInitial(HashMap::new);
+    private final ThreadLocal<Map<String, LockContent>> contentMapLocal = ThreadLocal.withInitial(HashMap::new);
+
+    // 定时续期任务线程池，合理设置大小
+    private final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(10);
 
     @Override
     public void lock(String name) {
         if (checkReentrant(name)) {
-            storeLock(name, true);
+            storeLock(name, null, true);
             return;
         }
         while (true) {
             if (tryLock0(name)) {
                 return;
             }
-            sleep(300, TimeUnit.MILLISECONDS);
+            sleep();
         }
     }
 
     @Override
     public boolean tryLock(String name) {
         if (checkReentrant(name)) {
-            storeLock(name, true);
+            storeLock(name, null, true);
             return true;
         }
         return tryLock0(name);
@@ -49,7 +56,7 @@ public class RedisLock implements DistributedLock {
     @Override
     public boolean tryLock(String name, long timeout, TimeUnit timeUnit) {
         if (checkReentrant(name)) {
-            storeLock(name, true);
+            storeLock(name, null, true);
             return true;
         }
         long totalTime = timeUnit.toMillis(timeout);
@@ -58,8 +65,7 @@ public class RedisLock implements DistributedLock {
             if (tryLock0(name)) {
                 return true;
             }
-            // 休息 300 毫秒
-            sleep(300, TimeUnit.MILLISECONDS);
+            sleep();
         }
         return false;
     }
@@ -69,15 +75,22 @@ public class RedisLock implements DistributedLock {
         if (!checkReentrant(name)) {
             return;
         }
-        Integer count = countMapLocal.get().get(name);
-        // 重入次数减一
+        LockContent lockContent = contentMapLocal.get().get(name);
+        Integer count = lockContent.getCount();
         if (count > 0) {
-            countMapLocal.get().put(name, --count);
+            // 重入次数减一
+            lockContent.setCount(--count);
         }
         // 释放锁
         if (count == 0) {
+            // 停止续期任务
+            lockContent.getFuture().cancel(true);
+            System.out.println("干掉续期任务了");
+            // 删除 Redis key
             redisTemplate.delete(name);
-            countMapLocal.get().remove(name);
+            System.out.println("干掉 key 了");
+            // 清除重入记录
+            contentMapLocal.get().remove(name);
         }
     }
 
@@ -92,7 +105,7 @@ public class RedisLock implements DistributedLock {
             throw new RuntimeException("锁名称不能为空");
         }
         // 判断是否重入
-        return Objects.nonNull(countMapLocal.get().get(name));
+        return Objects.nonNull(contentMapLocal.get().get(name));
     }
 
     /**
@@ -100,15 +113,17 @@ public class RedisLock implements DistributedLock {
      *
      * @param name 锁名称
      */
-    private void storeLock(String name, boolean reentrant) {
+    private void storeLock(String name, ScheduledFuture<?> future, boolean reentrant) {
+        LockContent lockContent;
         if (reentrant) {
+            lockContent = contentMapLocal.get().get(name);
             // 重入次数加一
-            Integer count = countMapLocal.get().get(name);
-            countMapLocal.get().put(name, count + 1);
+            lockContent.setCount(lockContent.getCount() + 1);
             return;
         }
-        // 初始化为 1
-        countMapLocal.get().put(name, 1);
+        // 创建新的 LockContent
+        lockContent = new LockContent(future, 1);
+        contentMapLocal.get().put(name, lockContent);
     }
 
     /**
@@ -118,26 +133,55 @@ public class RedisLock implements DistributedLock {
      * @return 是否设置成功
      */
     private boolean tryLock0(String name) {
-        Boolean success = redisTemplate.opsForValue().setIfAbsent(name, "");
+        Boolean success = redisTemplate.opsForValue().setIfAbsent(name, "", 30, TimeUnit.SECONDS);
         // 设置成功
         if (Objects.equals(success, true)) {
-            storeLock(name, false);
+            // 开启续期任务
+            ScheduledFuture<?> future = renewLock(name);
+            storeLock(name, future, false);
             return true;
         }
         return false;
     }
 
     /**
-     * 休眠一定时间
+     * 开启锁续期任务
      *
-     * @param timeout  超时时间
-     * @param timeUnit 时间单位
+     * @param name 锁名称
+     * @return ScheduledFuture
      */
-    private void sleep(long timeout, TimeUnit timeUnit) {
+    private ScheduledFuture<?> renewLock(String name) {
+        // 有效期设置为 30s，每 20 秒重置
+        return executor.scheduleAtFixedRate(() -> {
+            redisTemplate.opsForValue().setIfPresent(name, "", 30, TimeUnit.SECONDS);
+        }, 20, 20, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 休眠一定时间
+     */
+    private void sleep() {
         try {
-            timeUnit.sleep(timeout);
+            TimeUnit.MILLISECONDS.sleep(300);
         } catch (InterruptedException e) {
             // 不响应中断
         }
+    }
+
+    /**
+     * 锁内容
+     * 维护续期任务和重入次数
+     */
+    @Data
+    @AllArgsConstructor
+    private static class LockContent {
+        /**
+         * 续期任务
+         */
+        private ScheduledFuture<?> future;
+        /**
+         * 重入次数
+         */
+        private Integer count;
     }
 }
