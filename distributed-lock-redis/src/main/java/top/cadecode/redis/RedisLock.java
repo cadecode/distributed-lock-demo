@@ -85,10 +85,8 @@ public class RedisLock implements DistributedLock {
         if (count == 0) {
             // 停止续期任务
             lockContent.getFuture().cancel(true);
-            System.out.println("干掉续期任务了");
             // 删除 Redis key
             redisTemplate.delete(name);
-            System.out.println("干掉 key 了");
             // 清除重入记录
             contentMapLocal.get().remove(name);
         }
