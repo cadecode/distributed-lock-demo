@@ -1,4 +1,4 @@
-package top.cadecode.common;
+package top.cadecode.learn.distributedlock.common;
 
 import java.util.concurrent.TimeUnit;
 

@@ -1,11 +1,11 @@
-package top.cadecode.redis;
+package top.cadecode.learn.distributedlock.redis;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
-import top.cadecode.common.DistributedLock;
+import top.cadecode.learn.distributedlock.common.DistributedLock;
 
 import java.util.HashMap;
 import java.util.Map;

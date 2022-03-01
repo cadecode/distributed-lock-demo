@@ -1,4 +1,4 @@
-package top.cadecode.app;
+package top.cadecode.learn.distributedlock.app;
 
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;

@@ -1,10 +1,10 @@
-package top.cadecode.app.contorller;
+package top.cadecode.learn.distributedlock.app.contorller;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
-import top.cadecode.mysql.DatabaseLock;
+import top.cadecode.learn.distributedlock.mysql.DatabaseLock;
 
 import java.util.concurrent.TimeUnit;
 

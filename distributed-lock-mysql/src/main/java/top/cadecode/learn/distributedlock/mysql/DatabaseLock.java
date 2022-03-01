@@ -1,8 +1,8 @@
-package top.cadecode.mysql;
+package top.cadecode.learn.distributedlock.mysql;
 
 import lombok.*;
 import org.springframework.stereotype.Component;
-import top.cadecode.common.DistributedLock;
+import top.cadecode.learn.distributedlock.common.DistributedLock;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
