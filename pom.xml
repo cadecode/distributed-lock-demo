@@ -16,7 +16,7 @@
 
     <packaging>pom</packaging>
     <name>distributed-lock-demo</name>
-    <description>Demo project for distributed lock</description>
+    <description>利用数据库、Redis 实现分布式锁 demo</description>
 
     <repositories>
         <repository>
