@@ -100,7 +100,7 @@ public class RedisLock implements DistributedLock {
      */
     private boolean checkReentrant(String name) {
         if (Objects.isNull(name)) {
-            throw new RuntimeException("锁名称不能为空");
+            throw new RuntimeException("lock name cannot be null");
         }
         // 判断是否重入
         return Objects.nonNull(contentMapLocal.get().get(name));
@@ -132,14 +132,13 @@ public class RedisLock implements DistributedLock {
      */
     private boolean tryLock0(String name) {
         Boolean success = redisTemplate.opsForValue().setIfAbsent(name, "", 30, TimeUnit.SECONDS);
-        // 设置成功
-        if (Objects.equals(success, true)) {
-            // 开启续期任务
-            ScheduledFuture<?> future = renewLock(name);
-            storeLock(name, future, false);
-            return true;
+        if (Objects.equals(success, false)) {
+            return false;
         }
-        return false;
+        // 设置成功 开启续期任务
+        ScheduledFuture<?> future = renewLock(name, contentMapLocal.get());
+        storeLock(name, future, false);
+        return true;
     }
 
     /**
@@ -148,11 +147,18 @@ public class RedisLock implements DistributedLock {
      * @param name 锁名称
      * @return ScheduledFuture
      */
-    private ScheduledFuture<?> renewLock(String name) {
-        // 有效期设置为 30s，每 20 秒重置
+    private ScheduledFuture<?> renewLock(String name, Map<String, LockContent> contentMap) {
+        // 有效期设置为 30s，每 10 秒重置
         return executor.scheduleAtFixedRate(() -> {
-            redisTemplate.opsForValue().setIfPresent(name, "", 30, TimeUnit.SECONDS);
-        }, 20, 20, TimeUnit.SECONDS);
+            Boolean success = redisTemplate.opsForValue().setIfPresent(name, "", 30, TimeUnit.SECONDS);
+            if (Objects.equals(success, true)) {
+                return;
+            }
+            // 删除锁
+            contentMap.remove(name);
+            // 跑出异常停止任务
+            throw new RuntimeException("renew lock fail, key is " + name);
+        }, 10, 10, TimeUnit.SECONDS);
     }
 
     /**
