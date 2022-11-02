@@ -32,12 +32,16 @@ public class RedisLock implements DistributedLock {
 
     @Override
     public void lock(String name) {
+        lock(name, "");
+    }
+
+    public void lock(String name, String value) {
         if (checkReentrant(name)) {
             storeLock(name, null, true);
             return;
         }
         while (true) {
-            if (tryLock0(name)) {
+            if (tryLock0(name, value)) {
                 return;
             }
             sleep();
@@ -46,15 +50,23 @@ public class RedisLock implements DistributedLock {
 
     @Override
     public boolean tryLock(String name) {
+        return tryLock(name, "");
+    }
+
+    public boolean tryLock(String name, String value) {
         if (checkReentrant(name)) {
             storeLock(name, null, true);
             return true;
         }
-        return tryLock0(name);
+        return tryLock0(name, value);
     }
 
     @Override
     public boolean tryLock(String name, long timeout, TimeUnit timeUnit) {
+        return tryLock(name, "", timeout, timeUnit);
+    }
+
+    public boolean tryLock(String name, String value, long timeout, TimeUnit timeUnit) {
         if (checkReentrant(name)) {
             storeLock(name, null, true);
             return true;
@@ -62,7 +74,7 @@ public class RedisLock implements DistributedLock {
         long totalTime = timeUnit.toMillis(timeout);
         long current = System.currentTimeMillis();
         while (System.currentTimeMillis() - current <= totalTime) {
-            if (tryLock0(name)) {
+            if (tryLock0(name, value)) {
                 return true;
             }
             sleep();
@@ -130,13 +142,13 @@ public class RedisLock implements DistributedLock {
      * @param name 锁名称
      * @return 是否设置成功
      */
-    private boolean tryLock0(String name) {
-        Boolean success = redisTemplate.opsForValue().setIfAbsent(name, "", 30, TimeUnit.SECONDS);
+    private boolean tryLock0(String name, String value) {
+        Boolean success = redisTemplate.opsForValue().setIfAbsent(name, value, 30, TimeUnit.SECONDS);
         if (Objects.equals(success, false)) {
             return false;
         }
         // 设置成功 开启续期任务
-        ScheduledFuture<?> future = renewLock(name, contentMapLocal.get());
+        ScheduledFuture<?> future = renewLock(name, value, contentMapLocal.get());
         storeLock(name, future, false);
         return true;
     }
@@ -147,10 +159,10 @@ public class RedisLock implements DistributedLock {
      * @param name 锁名称
      * @return ScheduledFuture
      */
-    private ScheduledFuture<?> renewLock(String name, Map<String, LockContent> contentMap) {
+    private ScheduledFuture<?> renewLock(String name, String value, Map<String, LockContent> contentMap) {
         // 有效期设置为 30s，每 10 秒重置
         return executor.scheduleAtFixedRate(() -> {
-            Boolean success = redisTemplate.opsForValue().setIfPresent(name, "", 30, TimeUnit.SECONDS);
+            Boolean success = redisTemplate.opsForValue().setIfPresent(name, value, 30, TimeUnit.SECONDS);
             if (Objects.equals(success, true)) {
                 return;
             }
