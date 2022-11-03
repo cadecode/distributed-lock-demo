@@ -7,9 +7,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 import top.cadecode.learn.distributedlock.common.DistributedLock;
 
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -25,12 +25,16 @@ public class RedisLock implements DistributedLock {
 
     private final StringRedisTemplate redisTemplate;
 
-    private final ThreadLocal<Map<String, LockContent>> contentMapLocal = ThreadLocal.withInitial(HashMap::new);
+    private final Map<String, LockContent> contentMap = new ConcurrentHashMap<>();
 
     // 定时续期任务线程池，合理设置大小
     private final ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(10);
 
-    @Override
+    /**
+     * 阻塞式的获取锁
+     *
+     * @param name 锁名称
+     */
     public void lock(String name) {
         lock(name, "");
     }
@@ -48,7 +52,12 @@ public class RedisLock implements DistributedLock {
         }
     }
 
-    @Override
+    /**
+     * 尝试一次获取锁
+     *
+     * @param name 锁名称
+     * @return 是否获取到
+     */
     public boolean tryLock(String name) {
         return tryLock(name, "");
     }
@@ -61,7 +70,14 @@ public class RedisLock implements DistributedLock {
         return tryLock0(name, value);
     }
 
-    @Override
+    /**
+     * 尝试在一段时间内阻塞获取锁
+     *
+     * @param name     锁名称
+     * @param timeout  超时时间
+     * @param timeUnit 时间单位
+     * @return 是否获取到
+     */
     public boolean tryLock(String name, long timeout, TimeUnit timeUnit) {
         return tryLock(name, "", timeout, timeUnit);
     }
@@ -82,12 +98,17 @@ public class RedisLock implements DistributedLock {
         return false;
     }
 
+    /**
+     * 释放锁
+     *
+     * @param name 锁名称
+     */
     @Override
     public void unlock(String name) {
         if (!checkReentrant(name)) {
             return;
         }
-        LockContent lockContent = contentMapLocal.get().get(name);
+        LockContent lockContent = contentMap.get(name);
         Integer count = lockContent.getCount();
         if (count > 0) {
             // 重入次数减一
@@ -95,13 +116,36 @@ public class RedisLock implements DistributedLock {
         }
         // 释放锁
         if (count == 0) {
+            // 清除重入记录
+            contentMap.remove(name);
             // 停止续期任务
             lockContent.getFuture().cancel(true);
             // 删除 Redis key
             redisTemplate.delete(name);
-            // 清除重入记录
-            contentMapLocal.get().remove(name);
         }
+    }
+
+    /**
+     * 清除锁，不检查是不是本线程持有锁，强行删除缓存，应该在确认锁在当前节点持有的时候使用
+     * 两种情况，假设当前持有锁的线程为 A 节点线程 A1，其他线程有 A 节点线程 A2，B 节点线程 B1：
+     * 1. A 节点的线程清除了 A1 的锁，续期任务正常关闭
+     * 2. B1 清除了其他节点持有的锁
+     * 2.1 没有继续抢锁，A1 的续期任务会抛出异常后停止，并清理 contentMap
+     * 2.2 B1 抢到锁，如果间隔时间没有达到续期任务周期，A1 的续期任务可能会无限执行下去
+     * 2.3 A2 抢到锁，storeLock 时会关闭原续期任务
+     *
+     * @param name 锁名称
+     */
+    public void clear(String name) {
+        LockContent lockContent = contentMap.get(name);
+        if (Objects.nonNull(lockContent)) {
+            // 清除重入记录
+            contentMap.remove(name);
+            // 停止续期任务
+            lockContent.getFuture().cancel(true);
+        }
+        // 删除 Redis key
+        redisTemplate.delete(name);
     }
 
     /**
@@ -115,25 +159,30 @@ public class RedisLock implements DistributedLock {
             throw new RuntimeException("lock name cannot be null");
         }
         // 判断是否重入
-        return Objects.nonNull(contentMapLocal.get().get(name));
+        return Objects.nonNull(contentMap.get(name))
+                && contentMap.get(name).getCurrThread() == Thread.currentThread();
     }
 
     /**
-     * 保存重入次数到 ThreadLocal
+     * 保存重入次数到 contentMap
      *
      * @param name 锁名称
      */
     private void storeLock(String name, ScheduledFuture<?> future, boolean reentrant) {
-        LockContent lockContent;
+        LockContent lockContent = contentMap.get(name);
         if (reentrant) {
-            lockContent = contentMapLocal.get().get(name);
             // 重入次数加一
             lockContent.setCount(lockContent.getCount() + 1);
             return;
         }
+        // 防止有旧锁数据残留
+        if (Objects.nonNull(lockContent)) {
+            // 停止续期任务
+            lockContent.getFuture().cancel(true);
+        }
         // 创建新的 LockContent
-        lockContent = new LockContent(future, 1);
-        contentMapLocal.get().put(name, lockContent);
+        lockContent = new LockContent(future, 1, Thread.currentThread());
+        contentMap.put(name, lockContent);
     }
 
     /**
@@ -148,7 +197,7 @@ public class RedisLock implements DistributedLock {
             return false;
         }
         // 设置成功 开启续期任务
-        ScheduledFuture<?> future = renewLock(name, value, contentMapLocal.get());
+        ScheduledFuture<?> future = renewLock(name, value);
         storeLock(name, future, false);
         return true;
     }
@@ -159,8 +208,8 @@ public class RedisLock implements DistributedLock {
      * @param name 锁名称
      * @return ScheduledFuture
      */
-    private ScheduledFuture<?> renewLock(String name, String value, Map<String, LockContent> contentMap) {
-        // 有效期设置为 30s，每 10 秒重置
+    private ScheduledFuture<?> renewLock(String name, String value) {
+        // 有效期设置为 30s，每 15 秒重置
         return executor.scheduleAtFixedRate(() -> {
             Boolean success = redisTemplate.opsForValue().setIfPresent(name, value, 30, TimeUnit.SECONDS);
             if (Objects.equals(success, true)) {
@@ -168,9 +217,9 @@ public class RedisLock implements DistributedLock {
             }
             // 删除锁
             contentMap.remove(name);
-            // 跑出异常停止任务
+            // 抛出异常停止任务
             throw new RuntimeException("renew lock fail, key is " + name);
-        }, 10, 10, TimeUnit.SECONDS);
+        }, 15, 15, TimeUnit.SECONDS);
     }
 
     /**
@@ -199,5 +248,10 @@ public class RedisLock implements DistributedLock {
          * 重入次数
          */
         private Integer count;
+
+        /**
+         * 当前线程
+         */
+        private Thread currThread;
     }
 }
